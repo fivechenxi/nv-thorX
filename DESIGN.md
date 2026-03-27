@@ -21,6 +21,8 @@ This document describes the design of an instruction-level simulator for the **N
 
 ## 2. Target Hardware: NVIDIA Jetson Thor X
 
+> Note: Ceiling values in this section are provisional design inputs and MUST be validated against official Thor X documentation before implementation sign-off.
+
 ### 2.1 Key Specifications
 
 | Subsystem | Specification |
@@ -29,7 +31,7 @@ This document describes the design of an instruction-level simulator for the **N
 | GPU | NVIDIA Ampere — 2 048 CUDA cores |
 | DLA | 2× Deep Learning Accelerator v3.0 |
 | Memory | LPDDR5 — 256-bit bus |
-| Peak CPU FP64 | ~768 GFLOP/s |
+| Peak CPU FP64 | ~76.8 GFLOP/s (provisional) |
 | Peak GPU FP32 | ~16 TFLOP/s |
 | Peak GPU FP16 | ~32 TFLOP/s |
 | Peak mem bandwidth (CPU→DRAM) | ~68 GB/s |
@@ -44,7 +46,7 @@ The simulator covers three instruction domains:
 
 | Domain | ISA | Notes |
 |--------|-----|-------|
-| `cpu` | ARMv8.2-A (AArch64) | NEON/SVE SIMD included |
+| `cpu` | ARMv8.2-A (AArch64) | NEON SIMD in scope; SVE support is out of scope until hardware confirmation |
 | `gpu` | NVIDIA PTX ISA (virtual) | Mapped to Ampere micro-ops |
 | `dla` | NVDLA layer descriptor | Convolution / activation primitives |
 
@@ -54,9 +56,9 @@ The simulator covers three instruction domains:
 
 | ID | Requirement |
 |----|------------|
-| FR-01 | Accept instruction traces in JSON, assembly text, or PTX format. |
+| FR-01 | Accept instruction traces in JSON, assembly text, PTX, or DLA-JSON format. |
 | FR-02 | Decode every instruction into: mnemonic, operands, FLOP count, memory access size. |
-| FR-03 | Accumulate per-kernel metrics: total FLOPs, total bytes read, total bytes written. |
+| FR-03 | Accumulate per-kernel metrics: total FLOPs, DRAM bytes read/written, and on-chip bytes read/written. |
 | FR-04 | Compute arithmetic intensity for each kernel. |
 | FR-05 | Emit a Roofline model report (JSON + SVG) per hardware domain. |
 | FR-06 | Report whether each kernel is compute-bound or memory-bandwidth-bound. |
@@ -73,8 +75,8 @@ The simulator covers three instruction domains:
 │                                                                     │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐  │
 │  │  Trace Input │───▶│    Parser    │───▶│  Instruction Stream  │  │
-│  │  (JSON/ASM/  │    │  (per-domain)│    │  (decoded IR)        │  │
-│  │   PTX)       │    └──────────────┘    └──────────┬───────────┘  │
+│  │ (JSON/ASM/   │    │  (per-domain)│    │  (decoded IR)        │  │
+│  │ PTX/DLA-JSON)│    └──────────────┘    └──────────┬───────────┘  │
 │  └──────────────┘                                   │              │
 │                                                     ▼              │
 │                                         ┌──────────────────────┐   │
@@ -120,7 +122,7 @@ The simulator covers three instruction domains:
 Simulates in-order execution of the decoded stream. For each instruction it:
 
 - Adds the instruction's FLOP contribution to `kernel.total_flops`.
-- Resolves memory operands through the **Cache Simulator** to determine whether data hits cache or goes to DRAM, adding the corresponding bytes to `kernel.bytes_read` or `kernel.bytes_written`.
+- Resolves memory operands through the **Cache Simulator** to determine whether data hits cache or goes to DRAM, adding the corresponding bytes to `kernel.bytes_dram_*` or `kernel.bytes_onchip_*`.
 
 The cache simulator uses a simplified LRU set-associative model matching Thor X cache parameters.
 
@@ -132,9 +134,11 @@ KernelMetrics {
     domain:         Domain          # CPU | GPU | DLA
     instruction_count: int
     total_flops:    float           # summed FLOP weights
-    bytes_read:     int             # DRAM reads (post cache)
-    bytes_written:  int             # DRAM writes (post cache)
-    arithmetic_intensity: float     # computed = total_flops / (bytes_read + bytes_written)
+    bytes_dram_read: int            # DRAM reads (post cache)
+    bytes_dram_written: int         # DRAM writes (post cache)
+    bytes_onchip_read: int          # cache/shared/local reads
+    bytes_onchip_written: int       # cache/shared/local writes
+    arithmetic_intensity: float     # computed = total_flops / (bytes_dram_read + bytes_dram_written)
 }
 ```
 
@@ -147,6 +151,8 @@ For each `KernelMetrics`:
    ```
    P_attainable = min(P_peak_compute,  AI × BW_peak)
    ```
+   where `AI = total_flops / bytes_dram_total`.
+   If `bytes_dram_total == 0`, define `AI = +inf` and classify as compute-bound.
 3. Determine binding constraint:
    - `AI < ridge_point`  →  **memory-bandwidth bound**
    - `AI >= ridge_point` →  **compute bound**
@@ -170,9 +176,9 @@ Produces:
 
 | Ceiling | Value | Formula |
 |---------|-------|---------|
-| Peak FP64 scalar | 768 GFLOP/s | 2 FMA × 12 cores × 3.2 GHz |
-| Peak FP32 NEON (128-bit) | 3 072 GFLOP/s | 4× SIMD width |
-| Peak FP16 NEON | 6 144 GFLOP/s | 8× SIMD width |
+| Peak FP64 scalar | 76.8 GFLOP/s | 2 FLOP/cycle × 12 cores × 3.2 GHz |
+| Peak FP32 NEON (128-bit) | 307.2 GFLOP/s | 8 FLOP/cycle (4-lane FP32 FMA) × 12 cores × 3.2 GHz |
+| Peak FP16 NEON | 614.4 GFLOP/s | 16 FLOP/cycle (8-lane FP16 FMA) × 12 cores × 3.2 GHz |
 | Peak DRAM BW | 68 GB/s | LPDDR5 measured |
 | Peak L2 BW | ~820 GB/s | estimated |
 
@@ -189,10 +195,12 @@ Produces:
 ### 5.2 Ridge Points
 
 ```
-ridge_CPU_FP32  = P_peak_CPU_FP32  / BW_CPU_DRAM  ≈ 3 072 / 68   ≈ 45.2 FLOP/byte
+ridge_CPU_FP32  = P_peak_CPU_FP32  / BW_CPU_DRAM  ≈ 307.2 / 68   ≈ 4.52 FLOP/byte
 ridge_GPU_FP32  = P_peak_GPU_FP32  / BW_GPU_DRAM  ≈ 16 000 / 204 ≈ 78.4 FLOP/byte
 ridge_GPU_FP16  = P_peak_GPU_FP16  / BW_GPU_DRAM  ≈ 32 000 / 204 ≈ 156.9 FLOP/byte
 ```
+
+For INT8/TOPS ceilings, the same ridge formula applies but with `OPS` (not `FLOPs`) in both numerator and throughput axis units.
 
 ### 5.3 Roofline Chart Layout
 
@@ -216,32 +224,33 @@ Each kernel is plotted as a labelled dot. Dots to the left of the ridge are shad
 
 ### 6.1 AArch64 Weights (examples)
 
-| Mnemonic | FLOPs | Mem bytes |
-|----------|-------|-----------|
-| `fadd`, `fsub`, `fmul` | 1 | 0 |
-| `fmadd`, `fmla` | 2 | 0 |
-| `fdiv` | 1 | 0 |
-| `ldr` (64-bit) | 0 | 8 |
-| `str` (64-bit) | 0 | 8 |
-| `ld1` (128-bit NEON) | 0 | 16 |
-| `fmla.4s` (NEON 4×FP32) | 8 (4×FMA) | 0 |
-| `fcvt` | 1 | 0 |
+| Mnemonic | FLOPs | DRAM bytes | On-chip bytes |
+|----------|-------|------------|---------------|
+| `fadd`, `fsub`, `fmul` | 1 | 0 | 0 |
+| `fmadd`, `fmla` | 2 | 0 | 0 |
+| `fdiv` | 1 | 0 | 0 |
+| `ldr` (64-bit) | 0 | 8 | 0 |
+| `str` (64-bit) | 0 | 8 | 0 |
+| `ld1` (128-bit NEON) | 0 | 16 | 0 |
+| `fmla.4s` (NEON 4×FP32) | 8 (4×FMA) | 0 | 0 |
+| `fcvt` | 1 | 0 | 0 |
 
 ### 6.2 PTX Weights (examples)
 
-| PTX instruction | FLOPs | Mem bytes |
-|-----------------|-------|-----------|
-| `add.f32`, `mul.f32` | 1 | 0 |
-| `fma.f32` | 2 | 0 |
-| `ld.global.f32` | 0 | 4 |
-| `ld.shared.f32` | 0 | 4 (shared, not DRAM) |
-| `st.global.f32` | 0 | 4 |
-| `dp4a` (INT8 dot product) | 8 | 0 |
-| `mma.m16n8k16` (FP16 Tensor) | 512 | 0 |
+| PTX instruction | FLOPs | DRAM bytes | On-chip bytes |
+|-----------------|-------|------------|---------------|
+| `add.f32`, `mul.f32` | 1 | 0 | 0 |
+| `fma.f32` | 2 | 0 | 0 |
+| `ld.global.f32` | 0 | 4 | 0 |
+| `ld.shared.f32` | 0 | 0 | 4 |
+| `st.global.f32` | 0 | 4 | 0 |
+| `dp4a` (INT8 dot product) | 8 | 0 | 0 |
+| `mma.m16n8k16` (FP16 Tensor) | 512 | 0 | 0 |
 
 ### 6.3 Extension Points
 
 The weight tables are stored in `config/weights_cpu.yaml` and `config/weights_gpu.yaml`, enabling users to override or extend weights without code changes.
+For AI used in Roofline classification, only DRAM bytes are included in the denominator; on-chip bytes are reported separately for diagnostics.
 
 ---
 
@@ -282,6 +291,34 @@ str     q0,     [x1], #16
 
 Standard NVIDIA PTX `.ptx` files. The parser extracts `.func` bodies as kernels.
 
+### 7.4 DLA Trace (JSON)
+
+DLA input uses a JSON schema instead of raw descriptors so that P0/P1 can run without undocumented firmware formats.
+
+```json
+{
+  "domain": "dla",
+  "kernels": [
+    {
+      "name": "conv2d_block0",
+      "layers": [
+        {
+          "op": "conv2d",
+          "precision": "int8",
+          "input_shape": [1, 64, 56, 56],
+          "weight_shape": [64, 64, 3, 3],
+          "output_shape": [1, 64, 56, 56],
+          "estimated_ops": 231211008,
+          "estimated_bytes_dram": 6422528
+        }
+      ]
+    }
+  ]
+}
+```
+
+Required layer fields: `op`, `precision`, `input_shape`, `output_shape`, `estimated_ops`, `estimated_bytes_dram`.
+
 ---
 
 ## 8. Output Report Format
@@ -294,7 +331,7 @@ Standard NVIDIA PTX `.ptx` files. The parser extracts `.func` bodies as kernels.
   "domain": "gpu",
   "roofline_ceilings": {
     "peak_compute_gflops": 16000,
-    "peak_bandwidth_gbps": 204,
+    "peak_bandwidth_gb_per_s": 204,
     "ridge_point_flop_per_byte": 78.4
   },
   "kernels": [
@@ -302,11 +339,15 @@ Standard NVIDIA PTX `.ptx` files. The parser extracts `.func` bodies as kernels.
       "name": "matmul_fp32",
       "instruction_count": 1024,
       "total_flops": 2097152,
-      "bytes_dram": 131072,
+      "bytes_dram_read": 65536,
+      "bytes_dram_written": 65536,
+      "bytes_onchip_read": 0,
+      "bytes_onchip_written": 0,
       "arithmetic_intensity": 16.0,
       "attainable_gflops": 3264.0,
       "bound": "memory",
-      "utilization_pct": 20.4
+      "utilization_pct": 20.4,
+      "edge_case": null
     }
   ]
 }
@@ -403,6 +444,7 @@ thor-sim analyze --domain gpu --input trace.json --no-svg
 | P0 | `BaseParser` + JSON trace parser | Critical |
 | P0 | `ExecutionEngine` (no cache) + counter store | Critical |
 | P0 | `RooflineAnalyzer` + JSON report | Critical |
+| P0 | Doc consistency checks (units/formula/ridge/schema required fields) | Critical |
 | P1 | `AArch64Parser` (subset: NEON + scalar FP) | High |
 | P1 | `PTXParser` (scalar + Tensor Core ops) | High |
 | P1 | SVG chart renderer | High |
@@ -423,5 +465,5 @@ thor-sim analyze --domain gpu --input trace.json --no-svg
 
 ---
 
-*Document version: 0.1 — Initial draft*
+*Document version: 0.2 — Consistency and schema update*
 *Author: auto-generated via Claude Code*
