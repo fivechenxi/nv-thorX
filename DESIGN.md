@@ -27,18 +27,21 @@ This document describes the design of an instruction-level simulator for the **N
 
 | Subsystem | Specification |
 |-----------|--------------|
-| CPU | 12× Arm Cortex-A78AE @ ~3.2 GHz (Hercules-AE, ARMv8.2-A) |
-| GPU | NVIDIA Ampere — 2 048 CUDA cores |
-| DLA | 2× Deep Learning Accelerator v3.0 |
-| Memory | LPDDR5 — 256-bit bus |
-| Peak CPU FP64 | ~76.8 GFLOP/s (provisional) |
-| Peak GPU FP32 | ~16 TFLOP/s |
-| Peak GPU FP16 | ~32 TFLOP/s |
-| Peak mem bandwidth (CPU→DRAM) | ~68 GB/s |
-| Peak mem bandwidth (GPU→DRAM) | ~204 GB/s |
-| L1 cache (CPU, per core) | 64 KB |
-| L2 cache (CPU, shared) | 4 MB |
-| GPU L2 | 4 MB |
+| CPU | 14× Arm Neoverse-V3AE @ up to 2.6 GHz |
+| GPU | NVIDIA Blackwell — 2 560 CUDA cores, 96 5th-gen Tensor Cores |
+| DLA | Not explicitly disclosed in current public Thor module specs (TBD) |
+| Memory | LPDDR5X — 256-bit bus |
+| Peak CPU FP64 | TBD (no public official peak throughput value) |
+| Peak GPU FP32 | ~8.04 TFLOP/s (derived theoretical, CUDA path) |
+| Peak AI FP4 (sparse) | up to 2070 TFLOPS (official) |
+| Peak mem bandwidth (system DRAM) | 273 GB/s (official) |
+| L2 cache (CPU, per core) | 1 MB |
+| L3 cache (CPU, shared) | 16 MB |
+| GPU L2 | Not publicly specified in retrieved official summary pages |
+
+Source baseline for this revision:
+- NVIDIA Jetson Thor product page (module specs): 2560 CUDA, 14-core Neoverse-V3AE, 273 GB/s, up to 2070 FP4 TFLOPS.
+- NVIDIA Jetson Thor launch blog (public summary table, cross-check only).
 
 ### 2.2 Supported Instruction Domains
 
@@ -46,8 +49,8 @@ The simulator covers three instruction domains:
 
 | Domain | ISA | Notes |
 |--------|-----|-------|
-| `cpu` | ARMv8.2-A (AArch64) | NEON SIMD in scope; SVE support is out of scope until hardware confirmation |
-| `gpu` | NVIDIA PTX ISA (virtual) | Mapped to Ampere micro-ops |
+| `cpu` | AArch64 (Neoverse-V3AE class) | SIMD capability details should be finalized against target toolchain + microbench |
+| `gpu` | NVIDIA PTX ISA (virtual) | Mapped to Blackwell-era execution model |
 | `dla` | NVDLA layer descriptor | Convolution / activation primitives |
 
 ---
@@ -172,35 +175,36 @@ Produces:
 
 ### 5.1 Hardware Ceilings per Domain
 
-#### CPU Domain (Cortex-A78AE)
+#### CPU Domain (Neoverse-V3AE)
 
 | Ceiling | Value | Formula |
 |---------|-------|---------|
-| Peak FP64 scalar | 76.8 GFLOP/s | 2 FLOP/cycle × 12 cores × 3.2 GHz |
-| Peak FP32 NEON (128-bit) | 307.2 GFLOP/s | 8 FLOP/cycle (4-lane FP32 FMA) × 12 cores × 3.2 GHz |
-| Peak FP16 NEON | 614.4 GFLOP/s | 16 FLOP/cycle (8-lane FP16 FMA) × 12 cores × 3.2 GHz |
-| Peak DRAM BW | 68 GB/s | LPDDR5 measured |
-| Peak L2 BW | ~820 GB/s | estimated |
+| Peak FP64 scalar | TBD (calibrated) | `P_cpu_fp64 = N_core × f_cpu × T_fp64` |
+| Peak FP32 vector | TBD (calibrated) | `P_cpu_fp32 = N_core × f_cpu × T_fp32` |
+| Peak FP16 vector | TBD (calibrated) | `P_cpu_fp16 = N_core × f_cpu × T_fp16` |
+| Peak DRAM BW | 273 GB/s | official module spec |
+| Peak L2/L3 BW | TBD | requires micro-benchmark calibration |
 
-#### GPU Domain (Ampere)
+Where current public module values are `N_core = 14` and `f_cpu <= 2.6 GHz`.
 
-| Ceiling | Value |
-|---------|-------|
-| Peak FP32 | 16 TFLOP/s |
-| Peak FP16 (Tensor Core) | 32 TFLOP/s |
-| Peak INT8 (Tensor Core) | 64 TOPS |
-| Peak DRAM BW | 204 GB/s |
-| Peak L2 BW | ~2 TB/s |
+#### GPU Domain (Blackwell)
+
+| Ceiling | Value | Formula / Source |
+|---------|-------|------------------|
+| Peak FP32 (CUDA path) | ~8.04 TFLOP/s (derived) | `2560 cores × 1.57 GHz × 2 FLOP/cycle` |
+| Peak AI FP4 sparse (Tensor path) | up to 2070 TFLOPS (official) | NVIDIA Thor public spec |
+| Peak DRAM BW | 273 GB/s | NVIDIA Thor public spec |
+| Peak L2 BW | TBD | not provided in retrieved official summary pages |
 
 ### 5.2 Ridge Points
 
 ```
-ridge_CPU_FP32  = P_peak_CPU_FP32  / BW_CPU_DRAM  ≈ 307.2 / 68   ≈ 4.52 FLOP/byte
-ridge_GPU_FP32  = P_peak_GPU_FP32  / BW_GPU_DRAM  ≈ 16 000 / 204 ≈ 78.4 FLOP/byte
-ridge_GPU_FP16  = P_peak_GPU_FP16  / BW_GPU_DRAM  ≈ 32 000 / 204 ≈ 156.9 FLOP/byte
+ridge_GPU_FP32_derived     = P_peak_GPU_FP32_derived / BW_DRAM  ≈ 8 038.4 / 273 ≈ 29.4 FLOP/byte
+ridge_GPU_FP4_sparse_official = P_peak_GPU_FP4_sparse / BW_DRAM ≈ 2 070 000 / 273 ≈ 7 582 OPS/byte
 ```
 
-For INT8/TOPS ceilings, the same ridge formula applies but with `OPS` (not `FLOPs`) in both numerator and throughput axis units.
+CPU ridge points are intentionally left as parameterized outputs until `T_fp64/T_fp32/T_fp16` are calibrated on target silicon.
+For INT/FP4/FP8 AI ceilings, the same ridge formula applies but with `OPS` in both numerator and throughput axis units.
 
 ### 5.3 Roofline Chart Layout
 
@@ -327,12 +331,12 @@ Required layer fields: `op`, `precision`, `input_shape`, `output_shape`, `estima
 
 ```json
 {
-  "hardware": "Jetson ThorX / Ampere GPU",
+  "hardware": "Jetson AGX Thor / Blackwell GPU (T5000)",
   "domain": "gpu",
   "roofline_ceilings": {
-    "peak_compute_gflops": 16000,
-    "peak_bandwidth_gb_per_s": 204,
-    "ridge_point_flop_per_byte": 78.4
+    "peak_compute_gflops": 8038.4,
+    "peak_bandwidth_gb_per_s": 273,
+    "ridge_point_flop_per_byte": 29.4
   },
   "kernels": [
     {
@@ -344,9 +348,9 @@ Required layer fields: `op`, `precision`, `input_shape`, `output_shape`, `estima
       "bytes_onchip_read": 0,
       "bytes_onchip_written": 0,
       "arithmetic_intensity": 16.0,
-      "attainable_gflops": 3264.0,
+      "attainable_gflops": 4368.0,
       "bound": "memory",
-      "utilization_pct": 20.4,
+      "utilization_pct": 54.3,
       "edge_case": null
     }
   ]
